@@ -1,0 +1,14 @@
+.program irqtest
+.side_set 3
+
+    pull                    side 0x0
+    mov x, isr              side 0x0
+    pull                    side 0x0
+    mov y, isr              side 0x0
+loop1:
+    jmp x--, loop1          side 0x1
+    irq set 0 rel           side 0x2
+loop2:
+    jmp y--, loop2          side 0x2
+    irq wait 2 rel          side 0x6
+    irq clear 0 rel         side 0x2

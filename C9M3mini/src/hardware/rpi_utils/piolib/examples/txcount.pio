@@ -1,0 +1,20 @@
+;
+; Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+;
+; SPDX-License-Identifier: BSD-3-Clause
+;
+.pio_version 0 // only requires PIO version 0
+
+.program txcount
+.side_set 1
+
+.wrap_target
+    set x, 0            side 0
+loop:
+    pull block          side 0
+    jmp x--, no_jmp     side 1
+no_jmp:
+    mov isr, x          side 0
+    push noblock        side 0
+    jmp loop            side 0
+.wrap

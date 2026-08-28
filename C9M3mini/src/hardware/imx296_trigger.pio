@@ -1,0 +1,59 @@
+.program camera_trigger
+; XTR   (GPIO 17) 控制曝光，使用 set pins
+; FLASH (GPIO 23) 控制闪光灯，使用 side-set pins
+;
+; 协议 0 (预览): [mode_flag=0] [exposure_us] [blanking_us]
+; 协议 1 (拍摄): [mode_flag=1] [flash_delay_us] [exposure_us] [blanking_us]
+
+.side_set 1 opt
+
+.wrap_target
+idle:
+    set pins, 1   side 0        ; 确保空闲时 XTR=1(不曝光), FLASH=0(不闪光)
+    pull block                  ; 获取 mode_flag
+    mov x, osr
+    
+    jmp !x preview_mode         ; 如果 mode=0，进入预览分支
+    
+capture_mode:
+    pull block
+    mov x, osr                  ; x = offset_us - 1
+    pull block
+    mov isr, osr                ; isr = exposure_us - 1
+    pull block
+    mov y, osr                  ; y = blanking_us - 1
+    
+    jmp !x skip_flash_entirely  ; 如果 offset_us - 1 == 0，说明未开启闪光灯，完全跳过闪光激活
+    
+    nop           side 1        ; [点亮闪光灯] FLASH=1 (Pre-trigger)
+offset_loop:
+    jmp x-- offset_loop         ; 强制等待 offset_us 预热闪光灯
+    
+skip_flash_entirely:
+    set pins, 0                 ; 开始曝光
+    mov x, isr
+exposure_loop:
+    jmp x-- exposure_loop       ; delay 快门时间
+
+    set pins, 1   side 0        ; 曝光结束
+    push block                  ; 拍照结束
+    
+capture_blank_loop:
+    jmp y-- capture_blank_loop  ; delay 帧留白时间
+
+    jmp idle                    
+    
+preview_mode:
+    pull block
+    mov x, osr                  ; x = exposure_us - 1
+    pull block
+    mov y, osr                  ; y = blanking_us - 1
+    
+    set pins, 0                 ; 开始曝光
+prev_exp_loop:
+    jmp x-- prev_exp_loop       ; delay 快门时间
+    
+    set pins, 1                 ; 曝光结束
+prev_blank_loop:
+    jmp y-- prev_blank_loop     ; delay 帧留白时间
+.wrap

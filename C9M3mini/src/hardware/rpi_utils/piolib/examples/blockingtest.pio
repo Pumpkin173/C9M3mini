@@ -1,0 +1,33 @@
+;
+; Copyright (c) 2020 Raspberry Pi (Trading) Ltd.
+;
+; SPDX-License-Identifier: BSD-3-Clause
+;
+
+; Loops a word from the TX FIFO straight back into the RX FIFO. Run with a
+; slow clock divider so that the FIFOs genuinely fill and drain, forcing
+; pio_sm_put_blocking()/pio_sm_get_blocking() callers to actually block.
+.program blocking_loop
+.wrap_target
+    pull block
+    mov isr, osr
+    push block
+.wrap
+
+; Blocks waiting for irq flag 4 to be set (by an "irq set 4" instruction
+; injected into some other, otherwise-idle, state machine via
+; pio_sm_exec_wait_blocking()), then clears the flag and pushes a word to
+; the RX FIFO to signal that it has woken up.
+.program blocking_irq
+.wrap_target
+    wait 1 irq 4
+    irq clear 4
+    push block
+.wrap
+
+; Does nothing but spin, so that it is a valid target for one-off
+; instructions injected via pio_sm_exec()/pio_sm_exec_wait_blocking().
+.program blocking_idle
+.wrap_target
+    mov y, y
+.wrap

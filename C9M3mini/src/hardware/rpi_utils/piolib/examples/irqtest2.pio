@@ -1,0 +1,12 @@
+.program irqtest2
+.side_set 2
+
+    pull block              side 0x0
+    mov x, isr              side 0x0
+loop:
+    irq set 0 rel           side 0x1
+    irq clear 0 rel         side 0x3
+    wait 1 pin 0            side 0x2
+    wait 0 pin 0            side 0x0
+    jmp x--, loop           side 0x0
+    push block              side 0x0

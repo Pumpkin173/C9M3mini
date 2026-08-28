@@ -1,0 +1,1166 @@
+#!/usr/bin/env python3
+
+# Successor to the Perl 'overlaycheck'. Validates the overlay .dts files,
+# README, and Makefile in a kernel tree, the same way the Perl tool did,
+# but structural DT checks (dormant fragments, gpio/pinctrl wiring,
+# container-overlay parameter targets, override parameter extraction) work
+# by walking a parsed tree in-process (ovmerge_engine) instead of shelling
+# out to dtc/ovmerge and regexing their serialized text output. Real
+# compilation (cpp+dtc to .dtb/.dtbo) and the final base+overlay merge
+# validity check (dtmerge) still run as external tools - those exercise
+# the real toolchain, which isn't something to reimplement.
+#
+# Deliberately kept as a single file (plus the shared ovmerge_engine.py,
+# reused from the ovmerge tool) rather than split further, so installing
+# this script is just "copy one file" - see _search_dirs()/_find_file()
+# below for where it expects to find ovmerge_engine.py.
+
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _search_dirs():
+    """Places ovmerge_engine.py / the ovmerge CLI might live, in priority
+    order: next to this script (the two tools installed side by side into
+    one bin directory), the development-tree sibling layout (this script
+    under overlaycheck/, ovmerge under ../ovmerge/), then anywhere on
+    PATH (installed separately from this script but still reachable -
+    including a future 'ovmerge' with no '.py' suffix)."""
+    dirs = [_HERE, os.path.normpath(os.path.join(_HERE, '..', 'ovmerge'))]
+    dirs += [d for d in os.environ.get('PATH', '').split(os.pathsep) if d]
+    seen = set()
+    for d in dirs:
+        d = os.path.abspath(d)
+        if d not in seen:
+            seen.add(d)
+            yield d
+
+
+def _find_file(names):
+    """Full path to the first of names found across _search_dirs(), or None."""
+    for d in _search_dirs():
+        for name in names:
+            path = os.path.join(d, name)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+_engine_file = _find_file(['ovmerge_engine.py'])
+if _engine_file:
+    sys.path.insert(0, os.path.dirname(_engine_file))
+
+try:
+    from ovmerge_engine import (  # noqa: E402
+        NAME, OvMergeError, dtparam, dtparse, find_wakeable_fragments,
+        get_child, get_children, get_label_ref, get_labels,
+        get_node, get_prop, get_props, get_prop_string, node_path, ovapply1,
+        ovapply2,
+    )
+except ImportError:
+    fatal_msg = (
+        "Can't find ovmerge_engine.py. Install it next to this script, in a "
+        "sibling '../ovmerge' directory, or anywhere on PATH."
+    )
+    print(f"* {fatal_msg}")
+    sys.exit(1)
+
+# The 'ovmerge' CLI (currently ovmerge.py, eventually just 'ovmerge') is only
+# needed for the '// redo:' regeneration check - not for the import above.
+OVMERGE_PY = _find_file(['ovmerge', 'ovmerge.py'])
+DTMERGE = 'dtmerge'
+
+
+# Diagnostics
+# ---------------------------------------------------------------------------
+# Accumulator for overlaycheck2, replacing the Perl tool's global $fail flag
+# plus ad hoc error()/print() calls.
+
+class Reporter:
+    def __init__(self):
+        self.fail = False
+        self.context = None
+
+    def _emit(self, msg):
+        if self.context:
+            print(f"* {self.context}: {msg}")
+        else:
+            print(f"* {msg}")
+
+    def error(self, msg):
+        self._emit(msg)
+        self.fail = True
+
+    def warn(self, msg):
+        self._emit(msg)
+
+
+# Text-format parsers
+# ---------------------------------------------------------------------------
+# Parsers for the plain-text formats overlaycheck cross-references against
+# the Device Tree source: the overlays README, the overlays Makefile, and
+# the local exclusions file. These aren't tree-shaped, so they stay simple
+# line-oriented parsers (near-verbatim ports of the Perl tool's
+# parse_readme/parse_makefile/parse_exclusions), just taking a Reporter
+# instead of a global $fail flag.
+
+WORD_PATTERN = r'[0-9a-zA-Z0-9][-_a-zA-Z0-9]*'
+README_PARAM_PATTERN = r'([-_a-zA-Z0-9]|<[a-z]>|<[a-z]-[a-z]>)*'
+
+_DESCR_COLUMN = 32
+
+
+def parse_exclusions(path, reporter):
+    """Returns (ignore_missing, ignore_vestigial): overlay name -> list of
+    parameter names to exclude from the 'undocumented'/'vestigial' checks."""
+    ignore_missing = {}
+    ignore_vestigial = {}
+
+    try:
+        fh = open(path)
+    except OSError:
+        reporter.error(f"Failed to open '{path}'")
+        return ignore_missing, ignore_vestigial
+
+    overlay = None
+    with fh:
+        for line in fh:
+            line = line.rstrip('\n')
+
+            m = re.match(r'^=\s*(.+)$', line)
+            if m:
+                overlay = m.group(1)
+                ignore_missing[overlay] = []
+                ignore_vestigial[overlay] = []
+                continue
+
+            m = re.match(r'^-\s*(.+)$', line)
+            if m:
+                ignore_missing[overlay].append(m.group(1))
+                continue
+
+            m = re.match(r'^\+\s*(.+)$', line)
+            if m:
+                ignore_vestigial[overlay].append(m.group(1))
+                continue
+
+    return ignore_missing, ignore_vestigial
+
+
+def parse_readme(path, ignore_missing, ignore_vestigial, documentation, reporter):
+    """Parses the overlays README into {overlay_name: [param, ...]}.
+
+    ignore_missing/ignore_vestigial/documentation are dicts (as returned by
+    parse_exclusions for the first two) that get further entries added for
+    '<Deprecated>' and '<Documentation>' pseudo-overlays, matching the
+    original tool's behaviour of sharing these across both parsers.
+    """
+    overlays = {}
+
+    try:
+        fh = open(path)
+    except OSError:
+        reporter.error(f"Failed to open '{path}'")
+        return overlays
+
+    overlay = None
+    last_overlay = ''
+    params = None
+    has_params = False
+    in_params = False
+    blank_count = 0
+    linenum = 0
+
+    with fh:
+        for line in fh:
+            linenum += 1
+            line = line.rstrip('\n')
+
+            if '\t' in line:
+                reporter.error(f"TABs in README ({linenum})")
+            if re.search(r'\s$', line):
+                reporter.error(f"Trailing whitespace in README ({linenum})")
+            if len(line) > 80 and not re.match(r'^\s*[^\s]+$', line):
+                reporter.error(f"Line too long in README ({linenum})")
+
+            if overlay and not line:
+                blank_count += 1
+                if blank_count == 2:
+                    if params is None:
+                        reporter.error(f"Missing params for overlay {overlay} ({linenum})")
+                    if isinstance(params, list):
+                        overlays[overlay] = sorted(params)
+                    elif params:
+                        overlays[overlay] = params
+                    else:
+                        overlays[overlay] = []
+
+                    overlay = None
+                    params = None
+                    in_params = False
+                continue
+
+            blank_count = 0
+
+            if re.match(r'^\w+:\s', line) and not re.match(r'^(Name|Info|Load|Params):', line):
+                reporter.error(f"Bad label ({linenum})")
+
+            m = re.match(r'^Name:(\s*)(.*)\s*$', line)
+            if m:
+                if m.group(1) != '   ':
+                    reporter.error(f"Bad formatting in README ({linenum})")
+                if params is not None:
+                    reporter.error(f"Missing blank lines after overlay? ({linenum})")
+                overlay = m.group(2)
+                params = None
+                in_params = False
+                if not re.match(rf'^{WORD_PATTERN}$', overlay) and overlay != '<The base DTB>':
+                    reporter.error(f"Illegal overlay name '{overlay}' in README ({linenum})")
+
+                if not (overlay > last_overlay):
+                    reporter.error(f"Overlay '{overlay}' - order violation in README ({linenum})")
+                last_overlay = overlay if overlay != '<The base DTB>' else ' '
+                continue
+
+            m = re.match(r'^Info:(\s*)(.*)\s*$', line)
+            if m:
+                if m.group(1) != '   ':
+                    reporter.error(f"Bad formatting in README ({linenum})")
+                if not overlay:
+                    reporter.error(f"Info label with no Name? ({linenum})")
+                mm = re.match(rf'^See ({WORD_PATTERN})(?:\s+\(.*)?$', m.group(2))
+                if mm:
+                    params = mm.group(1)
+                continue
+
+            m = re.match(r'^Load:(\s*)(.*)\s*$', line)
+            if m:
+                if m.group(1) != '   ':
+                    reporter.error(f"Bad formatting in README ({linenum})")
+                if not overlay:
+                    reporter.error(f"Load label with no Name? ({linenum})")
+                cmd = m.group(2)
+                has_params = False
+                if overlay != '<The base DTB>':
+                    if cmd == '<Deprecated>':
+                        # Ignore this overlay
+                        ignore_missing[overlay] = True
+                        ignore_vestigial[overlay] = True
+                        overlay = None
+                    elif cmd == '<Documentation>':
+                        # Not a real overlay - a placeholder for common documentation
+                        documentation[overlay] = True
+                        ignore_missing[overlay] = True
+                        ignore_vestigial[overlay] = True
+                        has_params = True
+                    else:
+                        mm = re.match(
+                            rf'^dtoverlay=({WORD_PATTERN})(,<param>(?:=<val>|\[=<val>\])?)?$', cmd)
+                        if not mm:
+                            reporter.error(f"Invalid Load example ({linenum})")
+                        elif mm.group(1) != overlay:
+                            reporter.error(f"Wrong overlay name in Load example ({linenum})")
+                        if mm and mm.group(2):
+                            has_params = True
+                continue
+
+            m = re.match(r'^Params:(.*)$', line) if overlay is not None else None
+            if m:
+                blank_count = 0
+                rol = m.group(1)
+                params = []
+                in_params = True
+
+                if rol:
+                    if rol == ' <None>':
+                        if has_params:
+                            reporter.error(f"Parameter presence mismatch ({linenum})")
+                        continue
+                    mm = re.match(r'^ ([^ ]+)( *)', rol)
+                    if not mm:
+                        reporter.error(f"Bad formatting in README ({linenum})")
+                        continue
+                    if not has_params:
+                        reporter.error(f"Parameter presence mismatch ({linenum})")
+                    param, indent2 = mm.group(1), len(mm.group(2))
+                    if not re.fullmatch(README_PARAM_PATTERN, param):
+                        reporter.error(f"Invalid parameter name '{param}' in README ({linenum})")
+                    descr_indent = 8 + len(param) + indent2
+                    if descr_indent != _DESCR_COLUMN and indent2 != 0:
+                        reporter.error(f"Bad formatting in README ({linenum})")
+                    params.append(param)
+                continue
+
+            m = re.match(r'^( +)([^ ]+)( *)', line) if in_params else None
+            if m:
+                indent, param, indent2 = len(m.group(1)), m.group(2), len(m.group(3))
+                if indent == 8:
+                    descr_indent = 8 + len(param) + indent2
+                    # Try to spot a comment
+                    if ((indent2 == 1 or (indent2 == 0 and param.endswith(':'))) and
+                            descr_indent < _DESCR_COLUMN):
+                        in_params = False
+                        continue
+                    if not re.fullmatch(README_PARAM_PATTERN, param):
+                        reporter.error(f"Invalid parameter name '{param}' in README ({linenum})")
+                    if descr_indent != _DESCR_COLUMN and indent2 != 0:
+                        reporter.error(f"Bad formatting in README ({linenum})")
+                    params.append(param)
+                else:
+                    if indent < 8 or (indent > 8 and indent < _DESCR_COLUMN):
+                        reporter.error(f"Bad formatting in README ({linenum})")
+
+    # Resolve inter-overlay ("See") references
+    for name in list(overlays.keys()):
+        src = overlays[name]
+        if not isinstance(src, list):
+            resolved = overlays.get(src)
+            if isinstance(resolved, list):
+                overlays[name] = resolved
+            else:
+                reporter.error(f"Chained 'See' link from {name} to {src}")
+
+    return overlays
+
+
+def parse_makefile(path, reporter):
+    """Returns the ordered list of overlay names built by the Makefile,
+    with '<The base DTB>' prepended (matching the source-file set's
+    convention for the always-present base DTB entry)."""
+    overlays = ['<The base DTB>']
+
+    try:
+        fh = open(path)
+    except OSError:
+        reporter.error(f"Failed to open '{path}'")
+        return overlays
+
+    last_overlay = ''
+    linenum = 0
+    in_multiline = False
+
+    with fh:
+        for line in fh:
+            linenum += 1
+            line = line.rstrip('\n')
+            if re.search(r'\s$', line):
+                reporter.error(f"Trailing whitespace in Makefile ({linenum})")
+            overlay = None
+
+            if in_multiline:
+                m = re.match(r'^\t(.+)\.dtbo( \\)?$', line)
+                if m:
+                    overlay = m.group(1)
+                    if not m.group(2):
+                        in_multiline = False
+                else:
+                    reporter.error(f"Syntax error in Makefile ({linenum})")
+            else:
+                m = re.match(r'^dtbo-\$\(RPI_DT_OVERLAYS\) \+= (.+)\.dtbo$', line)
+                if m:
+                    overlay = m.group(1)
+                elif re.match(r'^dtbo-\$\(CONFIG_ARCH_BCM2835\) \+= \\$', line):
+                    in_multiline = True
+
+            if overlay:
+                if not (overlay > last_overlay):
+                    reporter.error(f"Overlay '{overlay}' - order violation in Makefile ({linenum})")
+                overlays.append(overlay)
+                last_overlay = overlay
+
+    return overlays
+
+
+# Checker registration and dispatch
+# ---------------------------------------------------------------------------
+# A "checker" is a Checker subclass, one fresh instance of which is created
+# for every tree walk - replacing the old approach of shelling out to
+# dtc/ovmerge and regexing their serialized text output line-by-line.
+#
+# Instantiating fresh per walk means a checker's own attributes are already
+# per-overlay state, there from on_node() to on_end() and gone again on the
+# next overlay's walk - no need to stash anything on the shared CheckContext.
+
+_CHECKER_CLASSES = []
+
+
+class Checker:
+    """Base class for a checker. Subclass it and set exactly one of `path`
+    or `name` (regex strings, anchored with .match() - use '$' to anchor the
+    end too) to have on_node() called for every node whose full path / own
+    name matches; the regex Match object is passed in, so capture groups
+    (e.g. a fragment number) are available without re-deriving them. Leave
+    both unset to skip per-node dispatch entirely.
+
+    on_end() is called once per walk, after every node has been visited
+    (and after any on_node() calls) - for checks that need to see the whole
+    tree, or to report on state on_node() accumulated across matching nodes.
+    Override either or both of on_node()/on_end(); the defaults do nothing.
+
+    Subclasses are auto-registered and instantiated fresh (no constructor
+    arguments) for each call to walk()."""
+
+    path = None
+    name = None
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if cls.path is not None and cls.name is not None:
+            raise ValueError(f"{cls.__name__}: set at most one of path/name")
+        cls._pattern = re.compile(cls.path if cls.path is not None else cls.name) \
+            if (cls.path is not None or cls.name is not None) else None
+        cls._on_path = cls.path is not None
+        _CHECKER_CLASSES.append(cls)
+
+    def on_node(self, node, ctx, m):
+        pass
+
+    def on_end(self, ctx):
+        pass
+
+
+class CheckContext:
+    """Passed to every checker: the parsed DT, which overlay/file it came
+    from, and the shared Reporter for surfacing errors/warnings."""
+
+    def __init__(self, dt, overlay_name, source_file, reporter):
+        self.dt = dt
+        self.overlay_name = overlay_name
+        self.source_file = source_file
+        self.reporter = reporter
+
+
+def walk(root, ctx):
+    """Visit every node in the tree rooted at root, dispatching to every
+    registered checker (a fresh instance per call) whose pattern matches,
+    then let each checker report via on_end()."""
+    instances = [cls() for cls in _CHECKER_CLASSES]
+
+    def visit(node):
+        path = None
+        for inst in instances:
+            pattern = inst._pattern
+            if pattern is None:
+                continue
+            if inst._on_path:
+                if path is None:
+                    path = node_path(node)
+                m = pattern.match(path)
+            else:
+                m = pattern.match(node[NAME])
+            if m:
+                inst.on_node(node, ctx, m)
+        for child in get_children(node):
+            visit(child)
+
+    visit(root)
+
+    for inst in instances:
+        inst.on_end(ctx)
+
+
+# Override-parameter / platform extraction
+# ---------------------------------------------------------------------------
+# Extracts the information the old Perl tool's get_params() scraped from
+# dtc's pretty-printed '-O dts' text output (override parameter names, and
+# which platform an overlay's 'compatible' string declares) - reading it
+# directly from the parsed tree instead.
+#
+# Note: the old get_params() also had a 'deadbeef' placeholder-value check
+# that only made sense because it was scanning dtc's re-serialized text;
+# with no text-scraping step to protect against, there's nothing for it to
+# guard here, so it's intentionally not carried over.
+
+_PLATFORM_RE = re.compile(r'^brcm,(bcm2835|bcm2711|bcm2712)$')
+
+
+class SourceInfo:
+    """What overlaycheck needs from one parsed base/overlay .dts file: its
+    __overrides__ parameter names, and (for overlays) which platform(s) its
+    'compatible' string declares support for."""
+
+    def __init__(self, params, platforms):
+        self.params = params
+        self.platforms = platforms
+
+
+def get_source_info(dt, source_file, reporter, is_overlay):
+    overrides = get_node(dt, '/__overrides__')
+    params = []
+    for prop in (get_props(overrides) if overrides is not None else []):
+        name = prop[0]
+        if not re.fullmatch(WORD_PATTERN, name):
+            reporter.error(f"Invalid parameter name '{name}' in '{source_file}'")
+        params.append(name)
+    params.sort()
+
+    platforms = set()
+    if is_overlay:
+        compat = get_prop_string(dt.root, 'compatible')
+        if compat is None:
+            reporter.error(f"Missing overlay compatible string in '{source_file}'")
+        else:
+            m = _PLATFORM_RE.match(compat)
+            if not m:
+                reporter.error(f"Invalid overlay compatible string '{compat}' in '{source_file}'")
+            else:
+                platforms.add(m.group(1))
+
+    return SourceInfo(params, platforms)
+
+
+# GPIO/pinctrl checks
+# ---------------------------------------------------------------------------
+# Checks around GPIO-hog/pinctrl fragments in an overlay:
+#  A) a child node of a fragment targeting the literal 'gpio' label, that
+#     isn't a gpio-hog, must have a label (otherwise nothing can reference it)
+#  B) every such label must actually be referenced by some 'pinctrl-0'
+#     property or override declaration
+#  C) an __overrides__ declaration must not target a fragment's own label
+#     (only its 'target'/'target-path' properties are legitimate to retarget)
+#
+# Replaces the old pinctrl_checker(), which tracked fragment/node/brace
+# depth by hand while reading 'ovmerge -N' text output line by line.
+# Unlike that version, this checks every direct child of a matching
+# fragment's payload (the old brace-depth tracker gave up on the rest of a
+# fragment's siblings after the first child that didn't match its
+# line-oriented pattern - e.g. any property appearing before a subnode, or a
+# subnode name containing '@'); this is intentionally more thorough.
+#
+# One deliberate behaviour change found while testing this against real
+# overlays: a labelled gpio-hog node no longer counts as needing a
+# pinctrl-0 reference. The old check's line-oriented pattern also excluded
+# '@'-addressed node names, which happened to hide this - a labelled hog
+# node with a unit address (e.g. "hog: hog@1a { gpio-hog; ... };", used so
+# an __overrides__ declaration can address it) was never actually reached by
+# the old checker. Once every child is checked, the old rule as literally
+# written would flag every such hog as an unreferenced pinctrl label, which
+# is wrong: a hog self-activates and was never meant to need one.
+
+_GPIO_LABEL = '&gpio'
+
+
+def _collect_pinctrl_refs(dt):
+    refs = set()
+
+    def walk_refs(node):
+        prop = get_prop(node, 'pinctrl-0')
+        if prop is not None:
+            for chunk in prop[1:]:
+                if chunk[0] == '<':
+                    for elem in chunk[2]:
+                        if isinstance(elem, str) and elem.startswith('&'):
+                            refs.add(elem[1:])
+        for child in get_children(node):
+            walk_refs(child)
+
+    walk_refs(dt.root)
+
+    overrides = get_node(dt, '/__overrides__')
+    for prop in (get_props(overrides) if overrides is not None else []):
+        dtparam(dt, prop[0], None, pinctrl_refs=refs)
+
+    return refs
+
+
+def _collect_misused_fragment_labels(dt, fraglabels):
+    misused = []
+    seen = set()
+
+    def on_label_use(label, prop):
+        if label in fraglabels and not prop.startswith('target') and label not in seen:
+            misused.append(label)
+            seen.add(label)
+
+    overrides = get_node(dt, '/__overrides__')
+    for prop in (get_props(overrides) if overrides is not None else []):
+        dtparam(dt, prop[0], None, label_use=on_label_use)
+
+    return misused
+
+
+class CheckPinctrl(Checker):
+    """Visits every fragment, tallying its label plus (for one targeting the
+    literal 'gpio' label) its unlabelled/labelled-non-hog children; reports
+    on the complete tallies once the whole tree has been seen."""
+
+    name = r'^fragment[@-](\d+)$'
+
+    def __init__(self):
+        self.fraglabels = set()
+        self.gpio_labels = set()
+        self.unlabelled_nodes = []
+
+    def on_node(self, node, ctx, m):
+        self.fraglabels.update(get_labels(node))
+
+        target = get_prop(node, 'target')
+        if target is None:
+            return
+        if get_label_ref(target[1]) != _GPIO_LABEL:
+            return
+
+        payload = get_child(node, '__overlay__') or get_child(node, '__dormant__')
+        if payload is None:
+            return
+
+        for sub in get_children(payload):
+            is_hog = get_prop(sub, 'gpio-hog') is not None
+            labels = get_labels(sub)
+            if labels:
+                if not is_hog:
+                    self.gpio_labels.update(labels)
+            elif not is_hog:
+                self.unlabelled_nodes.append(sub[NAME])
+
+    def on_end(self, ctx):
+        pinctrl_refs = _collect_pinctrl_refs(ctx.dt)
+
+        for name in sorted(self.unlabelled_nodes):
+            ctx.reporter.error(f"gpio node {name} has no label")
+
+        for label in sorted(self.gpio_labels):
+            if label not in pinctrl_refs:
+                ctx.reporter.error(f"gpio node label {label} is not referenced")
+
+        for label in _collect_misused_fragment_labels(ctx.dt, self.fraglabels):
+            ctx.reporter.error(f"misused fragment label {label}")
+
+
+# Container-overlay checks
+# ---------------------------------------------------------------------------
+# Checks that "container" overlays (i2c-rtc, i2c-fan, i2c-sensor: a menu of
+# optional devices selected via boolean __overrides__ params) actually wire
+# each parameter to the device node it's named after.
+#
+# Replaces the old container_checker(), which compiled the overlay to a
+# real .dtbo, ran 'fdtget -t bx' on each override to find the ones in the
+# fragment-toggle form (a raw byte match on the phandle cell being zero),
+# applied each one via the external 'dtmerge' binary, and grepped 'dtdiff'
+# text output for an added node. All of that is replaced by applying the
+# override and merging the fragment in-process (dtparam, then ovapply1 to
+# fold the newly-woken fragment into the local 'i2cbus' label these
+# overlays target - see i2c-buses.dtsi - before ovapply2 merges the result
+# onto a real base tree) and diffing node names directly, using the same
+# fragment-toggle-form test as find_wakeable_fragments() (the override's
+# first reference is the literal label '0', not a real node label).
+#
+# Only applies to CONTAINER_OVERLAYS, and needs ctx.info (the overlay's
+# SourceInfo, for its __overrides__ param names) and ctx.base0_dts_path (set
+# on the CheckContext before walking) - skipped like any other checker whose
+# match fails when neither is available.
+
+CONTAINER_OVERLAYS = ('i2c-rtc', 'i2c-fan', 'i2c-sensor')
+
+
+def _node_names(node, names):
+    names.add(node[NAME])
+    for child in get_children(node):
+        _node_names(child, names)
+
+
+class CheckContainer(Checker):
+    """Only applies to CONTAINER_OVERLAYS, and needs ctx.info (the overlay's
+    SourceInfo, for its __overrides__ param names) and ctx.base0_dts_path
+    (set on the CheckContext before walking) - skipped like any other
+    checker whose match fails when neither is available. Doesn't react to
+    individual nodes, so leaves on_node() unused and only does its work in
+    on_end()."""
+
+    def on_end(self, ctx):
+        if ctx.overlay_name not in CONTAINER_OVERLAYS or ctx.info is None or not ctx.base0_dts_path:
+            return
+
+        overlay_path = ctx.source_file
+        base_path = ctx.base0_dts_path
+        params = ctx.info.params
+        reporter = ctx.reporter
+
+        before = dtparse(base_path, False)
+        before_names = set()
+        _node_names(before.root, before_names)
+
+        for param in params:
+            ov = dtparse(overlay_path, False)
+            overrides = get_node(ov, '/__overrides__')
+            ovr = get_prop(overrides, param)
+            if ovr is None or len(ovr) < 2 or get_label_ref(ovr[1]) != '0':
+                continue
+
+            dtparam(ov, param, '')
+            ovapply1(ov)  # fold the newly-woken fragment into its (local) i2cbus label
+
+            base = dtparse(base_path, False)
+            try:
+                ovapply2(base, ov)
+            except OvMergeError as ex:
+                reporter.error(f"failed to merge with param '{param}': {ex}")
+                continue
+
+            after_names = set()
+            _node_names(base.root, after_names)
+            new_names = after_names - before_names
+
+            paramx = re.sub(r'\d$', 'x', param)
+            wanted = re.compile(rf'^({re.escape(param)}|{re.escape(paramx)})@')
+            if not any(wanted.match(name) for name in new_names):
+                reporter.error(f"parameter '{param}' doesn't enable matching node")
+
+
+# Dormant-fragment check
+# ---------------------------------------------------------------------------
+# Detects '__dormant__' fragment payloads that no __overrides__ declaration
+# can ever wake up. Replaces the old dormant_checker(), which tracked
+# fragment/__overrides__ structure by hand while reading 'ovmerge -N' text
+# output line by line.
+#
+# ctx.wakeable (a set of fragment-number strings, from
+# find_wakeable_fragments()) must be set on the CheckContext before walking
+# an overlay's tree with this checker registered.
+
+class CheckDormantFragment(Checker):
+    name = r'^fragment[@-](\d+)$'
+
+    def on_node(self, node, ctx, m):
+        if get_child(node, '__dormant__') is None:
+            return
+        num = m.group(1)
+        if num not in ctx.wakeable:
+            ctx.reporter.error(f"fragment {num} is dormant and cannot be activated")
+
+
+# Main
+# ---------------------------------------------------------------------------
+
+BASE_FILES = [
+    "bcm2712-rpi-5-b",
+    "bcm2712-rpi-cm5-cm5io",
+    "bcm2711-rpi-4-b",
+    "bcm2711-rpi-cm4",
+    "bcm2711-rpi-cm4s",
+    "bcm2708-rpi-b",
+    "bcm2708-rpi-b-rev1",
+    "bcm2708-rpi-b-plus",
+    "bcm2708-rpi-zero",
+    "bcm2708-rpi-zero-w",
+    "bcm2708-rpi-cm",
+    "bcm2709-rpi-2-b",
+    "bcm2710-rpi-3-b",
+    "bcm2710-rpi-3-b-plus",
+    "bcm2710-rpi-cm3",
+    "bcm2710-rpi-zero-2-w",
+]
+
+EXTRA_BASE_FILES = [
+    "bcm2709-rpi-cm2",
+    "bcm2710-rpi-cm0",
+    "bcm2710-rpi-2-b",
+    "bcm2711-rpi-400",
+    "bcm2712-rpi-500",
+    "bcm2712-rpi-cm5-cm4io",
+    "bcm2712-rpi-cm5l-cm5io",
+    "bcm2712-rpi-cm5l-cm4io",
+]
+
+PLATFORM_REPS = {
+    'bcm2835': 'bcm2710-rpi-3-b',
+    'bcm2711': 'bcm2711-rpi-4-b',
+    'bcm2712': 'bcm2712-rpi-5-b',
+}
+
+WARNINGS_TO_SUPPRESS = [
+    'unit_address_vs_reg', 'simple_bus_reg', 'unit_address_format',
+    'interrupts_property', 'gpios_property', 'label_is_string',
+    'unique_unit_address', 'avoid_unnecessary_addr_size',
+]
+
+NON_STRICT_WARNINGS = [
+    'pci_device_reg', 'pci_device_bus_num', 'reg_format',
+    'interrupt_provider', 'dma_ranges_format', 'avoid_default_addr_size',
+]
+
+# dtmerge's exit code when a base is simply incompatible with an overlay
+# (e.g. a missing target label) - expected/acceptable in the -t sweep.
+DTMERGE_LABEL_NOT_FOUND = 254
+
+
+def usage():
+    print("Usage: overlaycheck2 [<opts>] [<overlay> ...]")
+    print("  where <opts> can be any of:")
+    print()
+    print("    -h  Show this help message")
+    print("    -s  Show more strict/picky warnings")
+    print("    -t  Try all overlays on all base files")
+    print("    -v  Enable verbose output")
+
+
+def fatal(msg):
+    print(f"* {msg}")
+    sys.exit(1)
+
+
+def list_print(label, items, reporter):
+    if items:
+        print(f"{label}:")
+        for x in sorted(items):
+            print(f"  {x}")
+        reporter.fail = True
+
+
+def find_cpp():
+    for cmd in ('arm-linux-gnueabihf-cpp', 'aarch64-linux-gnu-cpp', 'cpp'):
+        if shutil.which(cmd):
+            return cmd
+    fatal("no suitable cpp found")
+
+
+def compute_dtc_opts(dtc, strict_dtc):
+    warnings = list(WARNINGS_TO_SUPPRESS)
+    if not strict_dtc:
+        warnings += NON_STRICT_WARNINGS
+    opts = []
+    for warn in warnings:
+        probe = subprocess.run([dtc, '-W', f'no-{warn}', '-v'],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if probe.returncode == 0:
+            opts += ['-W', f'no-{warn}']
+    return opts
+
+
+def dtc_cpp(cpp, dtc, dtc_opts, kerndir, cwd, infile, outfile, reporter):
+    tmpfile = outfile + '.tmp'
+    cpp_cmd = [cpp, '-nostdinc', '-I.', f'-I{kerndir}/include', '-Ioverlays',
+               '-undef', '-D__DTS__', '-x', 'assembler-with-cpp', '-o', tmpfile, infile]
+    if subprocess.run(cpp_cmd, cwd=cwd).returncode != 0:
+        reporter.error(f"Failed to CPP '{infile}'")
+        return
+    dtc_cmd = [dtc, *dtc_opts, '-i', 'overlays', '-@', '-I', 'dts', '-O', 'dtb', '-o', outfile, tmpfile]
+    if subprocess.run(dtc_cmd, cwd=cwd).returncode != 0:
+        reporter.error(f"Failed to compile '{infile}'")
+    if os.path.exists(tmpfile):
+        os.unlink(tmpfile)
+
+
+def _ovmerge_cmd(*args):
+    # A found '...ovmerge.py' needs the interpreter spelled out explicitly;
+    # a found bare 'ovmerge' is an installed executable with its own shebang.
+    if OVMERGE_PY.endswith('.py'):
+        return [sys.executable, OVMERGE_PY, *args]
+    return [OVMERGE_PY, *args]
+
+
+def check_redo_comment(file, overlay, reporter):
+    with open(file) as f:
+        first_line = f.readline()
+    if not re.match(r'^// redo: ', first_line):
+        return
+    if OVMERGE_PY is None:
+        reporter.warn(f"'{overlay}' has a redo comment but ovmerge could not be found to check it")
+        return
+    # The redo comment's arguments name sibling overlay files by relative
+    # path (e.g. "w1-gpio-overlay.dts,gpiopin=4"), so ovmerge must run with
+    # cwd set to this file's own directory to find them.
+    result = subprocess.run(_ovmerge_cmd('-r', file),
+                            capture_output=True, text=True, cwd=os.path.dirname(file))
+    if result.returncode != 0:
+        reporter.error(f"Failed to regenerate '{overlay}' from its redo comment")
+        return
+    with open(file) as f:
+        current = f.read()
+    if result.stdout != current:
+        reporter.warn(f"'{overlay}' overlay changed after redo")
+
+
+def parse_source_files(overlaysdir, dtsgroups, reporter):
+    params_union = set()
+
+    for group_dir, bases in dtsgroups:
+        for base in bases:
+            dts_file = os.path.join(group_dir, base + '.dts')
+            try:
+                dt = dtparse(dts_file, False)
+            except OvMergeError as ex:
+                reporter.error(f"Failed to parse base file {base}.dts: {ex}")
+                continue
+            info = get_source_info(dt, dts_file, reporter, is_overlay=False)
+            params_union.update(info.params)
+
+    source = {'<The base DTB>': SourceInfo(sorted(params_union), set())}
+
+    for file in sorted(glob.glob(os.path.join(overlaysdir, '*-overlay.dts'))):
+        overlay = os.path.basename(file)[:-len('-overlay.dts')]
+        check_redo_comment(file, overlay, reporter)
+        try:
+            dt = dtparse(file, False)
+        except OvMergeError as ex:
+            reporter.error(f"Failed to parse {overlay}-overlay.dts: {ex}")
+            continue
+        source[overlay] = get_source_info(dt, file, reporter, is_overlay=True)
+
+    return source
+
+
+def expand_documentation_params(params, readme, documentation):
+    expanded = []
+    for p in params:
+        if p in documentation:
+            expanded.extend(readme.get(p, []))
+        else:
+            expanded.append(p)
+    return expanded
+
+
+def resolve_placeholders(l, r):
+    l = set(l)
+    r = set(r)
+    for rv in list(r):
+        pattern, count = re.subn(r'<[i-z]>', '[0-9a-fA-F]+', rv)
+        if not count:
+            pattern, count = re.subn(r'<[a-h]>', '[a-z]', rv)
+        if not count:
+            continue
+        regex = re.compile(f'^{pattern}$')
+        matched = {lv for lv in l if regex.match(lv)}
+        if matched:
+            l -= matched
+            r.discard(rv)
+    return l, r
+
+
+def check_readme_vs_source(source, readme, ignore_missing, ignore_vestigial, documentation, reporter):
+    overlays = set(source.keys())
+    readme_overlays = set(readme.keys())
+
+    left_only = overlays - readme_overlays - set(ignore_missing.keys())
+    right_only = readme_overlays - overlays - set(ignore_vestigial.keys())
+    list_print("Overlays without documentation", left_only, reporter)
+    list_print("Vestigial overlay documentation", right_only, reporter)
+
+    for overlay in sorted(overlays & readme_overlays):
+        readme_params = expand_documentation_params(readme[overlay], readme, documentation)
+        l = set(source[overlay].params) - set(readme_params)
+        r = set(readme_params) - set(source[overlay].params)
+
+        l, r = resolve_placeholders(l, r)
+
+        excl_missing = ignore_missing.get(overlay, [])
+        excl_vestigial = ignore_vestigial.get(overlay, [])
+        l -= set(excl_missing if isinstance(excl_missing, list) else [])
+        r -= set(excl_vestigial if isinstance(excl_vestigial, list) else [])
+
+        list_print(f"{overlay} undocumented parameters", l, reporter)
+        list_print(f"{overlay} vestigial parameter documentation", r, reporter)
+
+
+def check_makefile_vs_source(source, makefile, reporter):
+    overlays = set(source.keys())
+    makefile_set = set(makefile)
+    list_print("Overlays missing from the Makefile", overlays - makefile_set, reporter)
+    list_print("Vestigial overlay Makefile entries", makefile_set - overlays, reporter)
+
+
+def check_one_overlay(overlay, overlaysdir, tmpdir, merged_dtb, base0_dts_path,
+                       source, reporter, verbose):
+    reporter.context = overlay
+    overlay_file = os.path.join(overlaysdir, overlay + '-overlay.dts')
+
+    try:
+        dt = dtparse(overlay_file, False)
+    except OvMergeError:
+        return  # already reported by parse_source_files
+
+    info = source.get(overlay)
+
+    ctx = CheckContext(dt, overlay, overlay_file, reporter)
+    ctx.wakeable = find_wakeable_fragments(dt)
+    ctx.info = info
+    ctx.base0_dts_path = base0_dts_path
+    walk(dt.root, ctx)
+
+    platforms = info.platforms if info else set()
+
+    base = None
+    for plat, rep_base in PLATFORM_REPS.items():
+        if plat in platforms:
+            base = rep_base
+            break
+
+    if base:
+        base_dtb = os.path.join(tmpdir, base + '.dtb')
+        overlay_dtbo = os.path.join(tmpdir, overlay + '.dtbo')
+        if os.path.isfile(base_dtb) and os.path.isfile(overlay_dtbo):
+            if verbose:
+                print(f"[ dtmerge {base_dtb} {merged_dtb} {overlay_dtbo} ]")
+            cmd = [DTMERGE, base_dtb, merged_dtb, overlay_dtbo]
+            if subprocess.run(cmd).returncode != 0:
+                reporter.error(f"Error in overlay {overlay}")
+
+
+def run_try_all(overlays, source, tmpdir, merged_dtb, verbose, reporter):
+    for overlay in overlays:
+        if overlay.startswith('<'):
+            continue
+        reporter.context = overlay
+        info = source.get(overlay)
+        platforms = info.platforms if info else set()
+        overlay_dtbo = os.path.join(tmpdir, overlay + '.dtbo')
+        if not os.path.isfile(overlay_dtbo):
+            continue
+
+        for base in BASE_FILES:
+            base_dtb = os.path.join(tmpdir, base + '.dtb')
+            if not os.path.isfile(base_dtb):
+                continue
+            if re.search(r'(wifi|bt)', overlay) and not re.match(
+                    r'^(bcm2708-rpi-zero-w|bcm2710-rpi-zero-2|bcm2710-rpi-3-|'
+                    r'bcm2711-rpi-(4|cm4$)|bcm2712-rpi-(5|cm5))', base):
+                continue
+            if overlay == 'vl805' and base == 'bcm2711-rpi-cm4s':
+                continue
+            if 'bcm2711' in platforms and not base.startswith('bcm2711'):
+                continue
+            if 'bcm2712' in platforms and not base.startswith('bcm2712'):
+                continue
+
+            probe = subprocess.run([DTMERGE, base_dtb, merged_dtb, overlay_dtbo],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if probe.returncode == DTMERGE_LABEL_NOT_FOUND:
+                continue
+
+            if verbose:
+                print(f"[ dtmerge {base_dtb} {merged_dtb} {overlay_dtbo} ]")
+            cmd = [DTMERGE, *(['-d'] if verbose else []), base_dtb, merged_dtb, overlay_dtbo]
+            if subprocess.run(cmd).returncode != 0:
+                reporter.error(f"Failed to merge {overlay} with {base}")
+
+
+def find_dts_path(base, dtsgroups):
+    for group_dir, bases in dtsgroups:
+        if base in bases:
+            return os.path.join(group_dir, base + '.dts')
+    return None
+
+
+def main(argv):
+    os.environ['LD_LIBRARY_PATH'] = os.path.join(os.path.expanduser('~'), 'lib')
+
+    verbose = False
+    strict_dtc = False
+    try_all = False
+
+    args = list(argv)
+    while args and args[0].startswith('-'):
+        arg = args.pop(0)
+        if arg == '-h':
+            usage()
+            return 0
+        elif arg == '-s':
+            strict_dtc = True
+        elif arg == '-t':
+            try_all = True
+        elif arg == '-v':
+            verbose = True
+        else:
+            fatal(f"Unknown option '{arg}'")
+
+    requested_overlays = args
+    reporter = Reporter()
+
+    kerndir = subprocess.run(['git', 'rev-parse', '--show-toplevel'],
+                              capture_output=True, text=True).stdout.strip()
+    if not kerndir or not os.path.isdir(os.path.join(kerndir, 'kernel')):
+        fatal("This isn't a Linux repository")
+
+    dtspath = os.path.join(kerndir, 'arch/arm/boot/dts/broadcom') \
+        if os.path.isfile(os.path.join(kerndir, 'arch/arm/boot/dts/broadcom/Makefile')) \
+        else os.path.join(kerndir, 'arch/arm/boot/dts')
+    dts64path = os.path.join(kerndir, 'arch/arm64/boot/dts/broadcom') \
+        if os.path.isfile(os.path.join(kerndir, 'arch/arm64/boot/dts/broadcom/Makefile')) \
+        else os.path.join(kerndir, 'arch/arm64/boot/dts')
+
+    base32, base64_, extra32, extra64 = [], [], [], []
+    for base in BASE_FILES:
+        if os.path.isfile(os.path.join(dtspath, base + '.dts')):
+            base32.append(base)
+        elif os.path.isfile(os.path.join(dts64path, base + '.dts')):
+            base64_.append(base)
+    for base in EXTRA_BASE_FILES:
+        if os.path.isfile(os.path.join(dtspath, base + '.dts')):
+            extra32.append(base)
+        elif os.path.isfile(os.path.join(dts64path, base + '.dts')):
+            extra64.append(base)
+
+    dtsgroups = [(dts64path, base64_), (dtspath, base32)]
+    extra_dtsgroups = [(dts64path, extra64), (dtspath, extra32)]
+    all_dtsgroups = dtsgroups + extra_dtsgroups
+
+    overlaysdir = os.path.join(kerndir, 'arch/arm/boot/dts/overlays')
+
+    cpp = find_cpp()
+    dtc = os.path.join(kerndir, 'scripts/dtc/dtc')
+    dtc_opts = compute_dtc_opts(dtc, strict_dtc)
+
+    exclusions_file = os.path.join(_HERE, 'overlaycheck_exclusions.txt')
+    ignore_missing, ignore_vestigial = parse_exclusions(exclusions_file, reporter)
+    documentation = {}
+
+    readme = parse_readme(os.path.join(overlaysdir, 'README'), ignore_missing,
+                           ignore_vestigial, documentation, reporter)
+
+    source = parse_source_files(overlaysdir, all_dtsgroups, reporter)
+
+    tmpdir = tempfile.mkdtemp(prefix='overlaycheck2-')
+    merged_dtb = os.path.join(tmpdir, 'merged.dtb')
+
+    try:
+        for group_dir, bases in all_dtsgroups:
+            for base in bases:
+                dtc_cpp(cpp, dtc, dtc_opts, kerndir, group_dir, base + '.dts',
+                        os.path.join(tmpdir, base + '.dtb'), reporter)
+
+        if not requested_overlays:
+            check_readme_vs_source(source, readme, ignore_missing, ignore_vestigial,
+                                    documentation, reporter)
+            makefile = parse_makefile(os.path.join(overlaysdir, 'Makefile'), reporter)
+            check_makefile_vs_source(source, makefile, reporter)
+            overlays = sorted(k for k in source.keys() if not k.startswith('<'))
+        else:
+            overlays = requested_overlays
+
+        overlay_map = os.path.join(overlaysdir, 'overlay_map.dts')
+        if os.path.isfile(overlay_map):
+            dtc_cpp(cpp, dtc, dtc_opts, kerndir, overlaysdir, 'overlay_map.dts',
+                    os.path.join(tmpdir, 'overlay_map.dtb'), reporter)
+
+        for overlay in overlays:
+            if overlay.startswith('<'):
+                continue
+            dtc_cpp(cpp, dtc, dtc_opts, kerndir, overlaysdir, overlay + '-overlay.dts',
+                    os.path.join(tmpdir, overlay + '.dtbo'), reporter)
+
+        base0_dts_path = find_dts_path(BASE_FILES[0], all_dtsgroups)
+
+        for overlay in overlays:
+            if overlay.startswith('<'):
+                continue
+            check_one_overlay(overlay, overlaysdir, tmpdir, merged_dtb, base0_dts_path,
+                               source, reporter, verbose)
+
+        if try_all:
+            run_try_all(overlays, source, tmpdir, merged_dtb, verbose, reporter)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    print("Failed" if reporter.fail else "OK")
+    return 1 if reporter.fail else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

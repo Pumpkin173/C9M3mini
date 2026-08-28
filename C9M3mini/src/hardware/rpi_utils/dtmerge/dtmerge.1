@@ -1,0 +1,80 @@
+.TH DTMERGE 1
+.
+.SH NAME
+dtmerge \- merge an overlay or parameters into a base device-tree
+.
+.
+.SH SYNOPSIS
+.SY dtmerge
+.OP \-d
+.I base-dtb
+.I merged-dtb
+.I overlay-dtb
+.RI [ param=val \|.\|.\|.]
+.YS
+.
+.SY dtmerge
+.B \-h
+.YS
+.
+.
+.SH DESCRIPTION
+.B dtmerge
+is a command line utility for merging overlays and/or device-tree parameters
+with a base device-tree.
+See
+.B [DTREE]
+for more information.
+.
+.PP
+The base device-tree (in dtb format) is always specified as the first
+(non-option) argument.
+The second argument is the output filename, which will also be in dtb format.
+The third argument provides the name of the overlay to merge into the base
+tree.
+If this is "-" then no overlay is used and the utility will simply customize
+the base tree with any parameters given.
+.
+.
+.SH OPTIONS
+.
+.TP
+.BR \-d
+Show debug output during operation.
+.
+.TP
+.BR \-h
+Displays help on the application.
+.
+.
+.SH EXAMPLES
+.
+.TP
+.B dtmerge /boot/bcm2711-rpi-4-b.dtb out.dtb - spi=on i2c=on
+Produce a device-tree for the Raspberry Pi 4 in "out.dtb" which has the SPI and
+I2C interfaces activated. No additional device-tree overlay is applied.
+.
+.TP
+.B dtmerge /boot/bcm2710-rpi-3-b-plus.dtb out.dtb /boot/overlays/gpio-shutdown.dtbo
+Produce a device-tree for the Raspberry Pi 3+ in "out.dtb" which includes the
+GPIO shutdown overlay (with all parameters set to their default).
+.
+.TP
+.B dtmerge /boot/bcm2712-rpi-5-b.dtb out.dtb /boot/overlays/mcp2515-can0.dtbo oscillator=12000000 interrupt=25 spimaxfrequency=2000000
+Produce a device-tree for the Raspberry Pi 5 in "out.dtb" which includes the
+MCP2515 CAN bus module overlay. The overlay is configured with the following
+settings: the oscillator frequency is set to 12 MHz (depending on the quartz
+crystal used), the interrupt GPIO pin is set to 25, and the SPI frequency is
+limited to 2 MHz.
+.
+.
+.SH SEE ALSO
+.BR dtoverlay (1),
+.BR dtparam (1),
+.B [DTREE]
+.
+.
+.SH REFERENCES
+.TP
+.B [DTREE]
+https://www.raspberrypi.com/documentation/computers/configuration.html#part5.2

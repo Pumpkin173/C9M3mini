@@ -1,0 +1,5 @@
+.program rxsource
+.side_set 1
+
+    push                    side 0x1
+    nop                     side 0x0
